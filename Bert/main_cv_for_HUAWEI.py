@@ -1,0 +1,264 @@
+import torch
+import torch.nn as nn
+import pandas as pd
+import numpy as np
+import jieba
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import train_test_split
+from sklearn import metrics
+from transformers import BertModel, AutoModel, BertForNextSentencePrediction, BertTokenizer, BertForQuestionAnswering
+from transformers import DistilBertTokenizerFast, DistilBertModel
+from transformers import RobertaTokenizer, RobertaModel, AutoTokenizer, AutoModelWithLMHead, \
+    get_linear_schedule_with_warmup
+import torch.nn.functional as F
+import random
+from sklearn.model_selection import KFold
+import os
+import moxing as mox
+#import s3fs
+
+
+seed = 2
+torch.manual_seed(seed)
+torch.cuda.manual_seed(seed)
+
+np.random.seed(seed)  # Numpy module.
+random.seed(seed)  # Python random module.
+torch.manual_seed(seed)
+torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.deterministic = True
+
+device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+
+
+class MyNSP(nn.Module):
+    def __init__(self, model_name, max_seq_len, hidden_size, n_class):
+        super(MyNSP, self).__init__()
+        self.bert_nsp = BertForNextSentencePrediction.from_pretrained(model_name, return_dict=True)
+
+    def forward(self, x, mask, token_type_ids):
+        outputs = self.bert_nsp(x, attention_mask=mask, token_type_ids=token_type_ids)
+        outputs = outputs.logits
+        return outputs
+
+
+class Bert_Fc(nn.Module):
+    def __init__(self, model_name, max_seq_len, hidden_size, n_class):
+        super(Bert_Fc, self).__init__()
+        self.bert = BertModel.from_pretrained(model_name, return_dict=True)
+        self.maxpool = nn.MaxPool1d(max_seq_len)
+        self.avgpool = nn.AvgPool1d(max_seq_len)
+        self.linear1 = nn.Linear(3 * hidden_size, hidden_size)
+        self.linear2 = nn.Linear(hidden_size, n_class)
+        self.tanh = nn.Tanh()
+
+    def forward(self, x, mask, token_type_ids):
+        bert_out = self.bert(x, attention_mask=mask, token_type_ids=token_type_ids)
+        # 取bert最后一层的[cls] token对应的向量作为句子向量
+        sentence_emb = bert_out.last_hidden_state[:, 0, :]
+        # 取最后一层的所有hidden_state shape (batch_size, sequence_length, hidden_size)
+        bert_out = bert_out.last_hidden_state.permute(0, 2, 1).contiguous()
+        # 对最后一层的所有hidden_state做最大池化操作
+        maxpool_out = self.maxpool(bert_out).squeeze(2)
+        # 对最后一层的所有hidden_state做均值池化操作
+        avgpool_out = self.avgpool(bert_out).squeeze(2)
+        # 拼接句子向量，最大池化向量，均值池化向量
+        outputs = torch.cat((maxpool_out, avgpool_out, sentence_emb), 1)
+        # 进入第一个全连接层用tanh做一下非线性变换
+        outputs = self.tanh(self.linear1(outputs))
+        # 最后一层全连接输出为(batch_size, num_class)
+        outputs = self.linear2(outputs)
+        return outputs
+
+
+class zyDataset(Dataset):
+    def __init__(self, encodings, labels, test=False):
+        self.encodings = encodings
+        self.len = len(self.encodings['input_ids'])
+        self.labels = labels
+        self.test = test
+
+    def __getitem__(self, idx):
+        item = {key: torch.tensor(val[idx]) for key, val in self.encodings.items()}
+        if not self.test:
+            item['labels'] = torch.tensor(self.labels['label'].tolist()[idx])
+        return item
+
+    def __len__(self):
+        return self.len
+
+
+def train(model, optimizer, scheduler, loss_func, train_iter, epoch):
+    model.train()
+    total_loss = 0
+    for idx, tr_batch in enumerate(train_iter):
+        input_ids = tr_batch['input_ids'].to(device)
+        token_type_ids = tr_batch['token_type_ids'].to(device)
+        attention_mask = tr_batch['attention_mask'].to(device)
+        label = tr_batch['labels'].to(device)
+
+        optimizer.zero_grad()
+        output = model(input_ids, attention_mask, token_type_ids)
+
+        loss = loss_func(output, label)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1)
+        optimizer.step()
+        scheduler.step()
+
+        total_loss += loss.item()
+        log_inte = 30
+        if idx % log_inte == 0 and idx != 0:
+            # writer.add_scalar('training loss',
+            #                 total_loss / log_inte,
+            #                 epoch * len(train_iter) + idx)
+            print('train-loss', total_loss / log_inte)
+            total_loss = 0
+    return model
+
+
+def evaluate(model, val_iter):
+    model.eval()
+    res = []
+    labels = []
+    total_loss = 0
+    with torch.no_grad():
+        for idx, val_batch in enumerate(val_iter):
+            input_ids = val_batch['input_ids'].to(device)
+            attention_mask = val_batch['attention_mask'].to(device)
+            token_type_ids = val_batch['token_type_ids'].to(device)
+            label = val_batch['labels'].to(device)
+            output = model(input_ids, attention_mask, token_type_ids)
+            loss = F.cross_entropy(output, label)
+            total_loss += loss.item()
+            output = torch.argmax(output, axis=1).tolist()
+            label = label.tolist()
+            labels += label
+            res += output
+    res = np.array(res)
+    labels = np.array(labels)
+    accuracy = metrics.accuracy_score(res, labels)
+    precision = metrics.precision_score(res, labels)
+    recall = metrics.recall_score(res, labels)
+    f1 = metrics.f1_score(res, labels)
+    print(accuracy, precision, recall, f1)
+    return total_loss / len(val_iter), f1
+
+
+def test(model, test_iter):
+    res = []
+    # model.load_state_dict(torch.load(save_path))
+    model.eval()
+    with torch.no_grad():
+        for idx, te_batch in enumerate(test_iter):
+            input_ids = te_batch['input_ids'].to(device)
+            attention_mask = te_batch['attention_mask'].to(device)
+            token_type_ids = te_batch['token_type_ids'].to(device)
+            output = model(input_ids, attention_mask, token_type_ids)
+            # output = torch.argmax(output, axis=1).tolist()
+            output = output.tolist()
+            res += output
+    return np.array(res)
+
+
+if __name__ == '__main__':
+    mox.file.shift('os', 'mox')
+    '''
+    print(os.listdir('s3://bert-large-zzb'))
+    with open('obs://bert-large-zzb/hello_world.txt', 'a') as f:
+        print(f.write("abcd"))
+    '''
+    basedir = os.path.abspath(os.path.dirname(__file__))
+    print(basedir)
+    max_seq_len = 100
+    hidden_size = 1024
+    n_class = 2
+    batch_size = 64
+    model_name = basedir+'/data/chinese_roberta_wwm_large_ext_pytorch'
+
+    epochs = 10
+    lr = 1e-6
+    min_loss = float('inf')
+    last_imporve = 0
+    total_batch = 0
+    early_stop = 20
+
+
+    train_data = pd.read_csv(basedir+'/data/backTransTrain.csv')
+    test_data = pd.read_csv(basedir+'/data/test.csv')
+
+    print("success")
+
+    feature_cols = ['query', 'reply']
+    label_cols = ['label']
+    kf = KFold(n_splits=5)
+    k = 0
+    res_proba = np.zeros((len(test_data), 2))
+
+    for tr_idx, val_idx in kf.split(train_data):
+        k += 1
+        train_x, train_y = train_data[feature_cols].loc[tr_idx], train_data[label_cols].loc[tr_idx]
+        val_x, val_y = train_data[feature_cols].loc[val_idx], train_data[label_cols].loc[val_idx]
+        tokenizer = BertTokenizer.from_pretrained(model_name)
+        print("tokenizer finished...")
+        train_encodings = tokenizer(train_x['query'].tolist(), train_x['reply'].tolist(), truncation=True, padding=True,
+                                    max_length=max_seq_len)
+        val_encodings = tokenizer(val_x['query'].tolist(), val_x['reply'].tolist(), truncation=True, padding=True,
+                                  max_length=max_seq_len)
+        test_encodings = tokenizer(test_data['query'].tolist(), test_data['reply'].tolist(), truncation=True,
+                                   padding=True, max_length=max_seq_len)
+
+        train_dataset = zyDataset(train_encodings, train_y[label_cols].reset_index(drop=True))
+        val_dataset = zyDataset(val_encodings, val_y[label_cols].reset_index(drop=True))
+        test_dataset = zyDataset(test_encodings, None, test=True)
+
+        train_iter = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+        val_iter = DataLoader(val_dataset, batch_size=batch_size, shuffle=True)
+        test_iter = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+
+        num_training_steps = len(train_iter) * epochs
+
+        model = Bert_Fc(model_name, max_seq_len, hidden_size, n_class)
+        model.to(device)
+        # model.load_state_dict(torch.load('./model/last.ckpt'))
+        loss_func = nn.CrossEntropyLoss()
+        no_decay = ['bias', 'LayerNorm.weight']
+        optimizer_grouped_parameters = [
+            {'params': [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+             'weight_decay': 0.01},
+            {'params': [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
+        ]
+        optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=lr)
+        #save_path = 's3://bert-large-zzb/output/best_trans.ckpt'
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer, num_warmup_steps=100, num_training_steps=num_training_steps
+        )
+        for epoch in range(1, epochs + 1):
+            print('{}[{}/{}]'.format(k, epoch, epochs))
+            model = train(model, optimizer, scheduler, loss_func, train_iter, epoch)
+            val_loss, f1 = evaluate(model, val_iter)
+            print('test-loss', val_loss)
+            # writer.add_scalar('val loss',
+            #             val_loss,
+            #             epoch)
+            total_batch = epoch
+            # state = {'model': model.state_dict(), 'optimizer': optimizer.state_dict(), 'epoch': epoch, 'k': k}
+            # torch.save(model.state_dict(), 's3://bert-large-zzb/output/last_trans.ckpt')
+
+            if val_loss < min_loss:
+                min_loss = val_loss
+                print('saving')
+                # torch.save(model.state_dict(), save_path)
+                last_imporve = total_batch
+            if (total_batch - last_imporve) >= early_stop:
+                break
+        res = test(model, test_iter)
+        res_proba += res
+        torch.cuda.empty_cache()
+    res_proba = res_proba / 5
+    res = np.argmax(res_proba, axis=1)
+    submit = pd.DataFrame()
+    submit['id'] = test_data['id']
+    submit['reply_sort'] = test_data['reply_sort']
+    submit['label'] = res
+    submit.to_csv('s3://bert-large-zzb/output/submit_cv_rbt_large-trans.tsv', sep='\t', header=False, index=False)
